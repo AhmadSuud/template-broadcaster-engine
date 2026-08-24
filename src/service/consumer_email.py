@@ -57,12 +57,11 @@ class ConsumerEmail:
         msg["To"] = ", ".join(receiver) if isinstance(receiver, (list, tuple)) else receiver
         msg["Subject"] = subject
         
-        # Set konten sebagai HTML agar desain dari database bisa terlihat rapi
         msg.set_content(body, subtype='html') 
 
         with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
             server.ehlo()
-            server.starttls()  # upgrade to secure TLS
+            server.starttls()  
             server.ehlo()
             server.login(self.smtp_user, self.smtp_pass)
             server.send_message(msg)

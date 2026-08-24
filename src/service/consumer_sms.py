@@ -3,23 +3,21 @@ import http.client
 from confluent_kafka import Consumer, Producer, KafkaError
 from src.core.config import settings
 
-class ConsumerWA:
+class ConsumerSMS:
     def __init__(self):
         self.kafka_broker = settings.KAFKA_BOOTSTRAP_SERVERS
         self.kafka_group_id = settings.KAFKA_GROUP_ID
-        self.kafka_topic = settings.KAFKA_WA_TOPIC
+        self.kafka_topic = settings.KAFKA_SMS_TOPIC
         
-        # Topik khusus untuk mengirim laporan status WA
-        self.kafka_status_topic = getattr(settings, 'KAFKA_STATUS_WA_TOPIC', 'notification.status.wa')
-        
+        self.kafka_status_topic = getattr(settings, 'KAFKA_STATUS_SMS_TOPIC', 'notification.status.sms')
         self._auto_offset_reset = 'earliest'
         
         self.consumer_conf = self.create_consumer_conf()
         self.producer = Producer({'bootstrap.servers': self.kafka_broker})
         
-        # Inisialisasi WHAPI Config
-        self.whapi_base_url = settings.WHAPI_BASE_URL
-        self.whapi_token = settings.WHAPI_TOKEN
+        self.infobip_base_url = settings.INFOBIP_BASE_URL
+        self.infobip_api_key = settings.INFOBIP_API_KEY
+        self.infobip_sender = settings.INFOBIP_SENDER
 
     def create_consumer_conf(self):
         return {
@@ -44,61 +42,42 @@ class ConsumerWA:
             )
             self.producer.poll(0)
         except Exception as e:
-            print(f"Gagal mengirim status WA ke Kafka: {e}")
+            print(f"Gagal mengirim status SMS ke Kafka: {e}")
 
-    def send_whapi_message(self, receiver, text_content):
-        """Fungsi khusus untuk menembak API WHAPI Cloud"""
-        # Bersihkan format nomor (hapus '+', WHAPI membutuhkan format E.164)
-        clean_receiver = receiver.replace('+', '').replace(' ', '')
+    def send_infobip_sms(self, receiver, text_content):
+        clean_receiver = receiver.replace('+', '')
         
-        conn = http.client.HTTPSConnection(self.whapi_base_url)
+        conn = http.client.HTTPSConnection(self.infobip_base_url)
         payload = json.dumps({
-            "typing_time": 0,
-            "to": clean_receiver,
-            # Hapus literal "\n" agar enter berfungsi di WhatsApp
-            "body": text_content.replace('\\n', '\n')
+            "messages": [
+                {
+                    "destinations": [{"to": clean_receiver}],
+                    "sender": self.infobip_sender,
+                    "content": {"text": text_content}
+                }
+            ]
         })
         
         headers = {
-            'Authorization': f'Bearer {self.whapi_token}',
+            'Authorization': f'App {self.infobip_api_key}',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
         
-        # Endpoint Whapi untuk mengirim pesan teks standar
-        conn.request("POST", "/messages/text", payload, headers)
+        conn.request("POST", "/sms/3/messages", payload, headers)
         res = conn.getresponse()
         data = res.read()
         response_str = data.decode("utf-8")
         
-        # 1. Cek Status HTTP Dasar
-        if res.status not in (200, 201):
-            raise Exception(f"WHAPI HTTP Error {res.status}: {response_str}")
-            
-        # 2. FITUR BARU: Deteksi Positif Palsu dari isi JSON Whapi
-        try:
-            response_json = json.loads(response_str)
-            
-            # Whapi kadang mengembalikan objek "message", kadang array "messages"
-            status = None
-            if "message" in response_json:
-                status = response_json["message"].get("status")
-            elif "messages" in response_json and len(response_json["messages"]) > 0:
-                status = response_json["messages"][0].get("status")
-                
-            # Jika Whapi menyatakan failed, batalkan status SUCCESS kita!
-            if status == "failed":
-                raise Exception("Whapi Delivery Failed: HP Pengirim Offline atau Nomor Tujuan tidak memiliki WhatsApp.")
-                
-        except json.JSONDecodeError:
-            pass # Abaikan jika kebetulan respons bukan format JSON
+        if res.status not in (200, 201, 202):
+            raise Exception(f"Infobip API Error {res.status}: {response_str}")
             
         return response_str
 
     def consume(self):
         consumer = Consumer(self.consumer_conf)
         consumer.subscribe([self.kafka_topic])
-        print(f"Broadcaster WhatsApp (WHAPI) Listening on topic: {self.kafka_topic}...")
+        print(f"Broadcaster SMS (Infobip) Listening on topic: {self.kafka_topic}...")
         
         try:
             while True:
@@ -123,19 +102,14 @@ class ConsumerWA:
                         receiver = receiver[0]
                         
                     body_text = data.get('body')
+                    print(f"Menerima SMS untuk: {receiver}")
                     
-                    print(f"Menerima WA untuk: {receiver}")
-                    
-                    # 1. Eksekusi pengiriman WA
-                    response = self.send_whapi_message(receiver, body_text)
-                    print(f"WhatsApp berhasil dikirim ke {receiver} via WHAPI.")
-                    
-                    # 2. Kirim laporan SUCCESS ke ETL Engine
+                    response = self.send_infobip_sms(receiver, body_text)
+                    print(f"SMS berhasil dikirim ke {receiver} via Infobip.")
                     self.send_status(event_id, "SUCCESS")
                     
                 except Exception as e:
-                    print(f"  Gagal memproses/mengirim WA: {e}")
-                    # 3. Kirim laporan FAILED jika gagal
+                    print(f"  Gagal memproses/mengirim SMS: {e}")
                     if event_id:
                         self.send_status(event_id, "FAILED", str(e))
                         
