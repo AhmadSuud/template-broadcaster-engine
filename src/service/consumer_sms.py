@@ -4,8 +4,6 @@ from src.core.rate_limiter import global_rate_limiter
 from src.core.channel_manager import global_channel_manager
 import http.client
 import json
-import time
-
 class ConsumerSMS:
     def __init__(self):
         self.kafka_topic = settings.KAFKA_SMS_TOPIC
@@ -55,9 +53,6 @@ class ConsumerSMS:
                     data = msg.value()
                     event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    # if not global_rate_limiter.acquire("sms"):
-                    #     self.send_status(event_id, "DROPPED", "Rate limit tercapai")
-                    #     continue
 
                     receiver = data.get('receiver')[0] if isinstance(data.get('receiver'), list) else data.get('receiver')
                     
@@ -67,7 +62,7 @@ class ConsumerSMS:
                     print(f"[INFOBIP] SMS sukses terkirim ke {receiver}", flush=True)
                     
                     self.send_status(event_id, "SUCCESS")
-                    time.sleep(0.52)
+                    global_rate_limiter.acquire("sms")
                 except Exception as e:
                     print(f"[{event_id}] [GAGAL] Pengiriman SMS: {e}", flush=True)
                     if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))

@@ -4,8 +4,6 @@ from src.core.rate_limiter import global_rate_limiter
 from src.core.channel_manager import global_channel_manager
 import smtplib
 from email.message import EmailMessage
-import time
-
 class ConsumerEmail:
     def __init__(self):
         self.kafka_topic = settings.KAFKA_EMAIL_TOPIC
@@ -60,9 +58,6 @@ class ConsumerEmail:
                     data = msg.value() 
                     event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    # if not global_rate_limiter.acquire("email"):
-                    #     self.send_status(event_id, "DROPPED", "Rate limit tercapai")
-                    #     continue
 
                     print(f"\n=======================================================", flush=True)
                     print(f"[{event_id}] Mencoba mengirim via SMTP dinamis...", flush=True)
@@ -70,7 +65,7 @@ class ConsumerEmail:
                     print(f"[SMTP] Email sukses terkirim ke: {data.get('receiver')}", flush=True)
                     
                     self.send_status(event_id, "SUCCESS")
-                    time.sleep(0.52)
+                    global_rate_limiter.acquire("email")
                 except Exception as e:
                     print(f"[{event_id}] [GAGAL] Pengiriman Email: {e}", flush=True)
                     if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))
