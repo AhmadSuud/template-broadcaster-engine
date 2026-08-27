@@ -61,7 +61,7 @@ class ConsumerEmail:
 
                     print(f"\n=======================================================", flush=True)
                     print(f"[{event_id}] Mencoba mengirim via SMTP dinamis...", flush=True)
-                    # self.send_email(data.get('receiver'), data.get('subject'), data.get('body'))
+                    self.send_email(data.get('receiver'), data.get('subject'), data.get('body'))
                     print(f"[SMTP] Email sukses terkirim ke: {data.get('receiver')}", flush=True)
                     
                     self.send_status(event_id, "SUCCESS")
