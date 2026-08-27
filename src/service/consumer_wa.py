@@ -45,7 +45,7 @@ class ConsumerWA:
         
         try:
             while True:
-                msg = consumer.poll(1.0)
+                msg = consumer.poll(0.1)
                 if msg is None or msg.error(): continue
                 
                 try:
