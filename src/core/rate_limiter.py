@@ -44,6 +44,7 @@ class RateLimiter:
         with self.lock:
             throttle_ms = self.throttle.get(channel.lower(), 0)
         if throttle_ms > 0:
+            print(f"[RATE LIMITER] channel={channel} throttle={throttle_ms}ms", flush=True)
             time.sleep(throttle_ms / 1000.0)
 
 global_rate_limiter = RateLimiter()
