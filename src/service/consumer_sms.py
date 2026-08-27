@@ -1,121 +1,76 @@
-import json
-import http.client
-from confluent_kafka import Consumer, Producer, KafkaError
+from confluent_kafka import DeserializingConsumer, SerializingProducer
 from src.core.config import settings
+from src.core.rate_limiter import global_rate_limiter
+from src.core.channel_manager import global_channel_manager
+import http.client
+import json
 
 class ConsumerSMS:
     def __init__(self):
-        self.kafka_broker = settings.KAFKA_BOOTSTRAP_SERVERS
-        self.kafka_group_id = settings.KAFKA_GROUP_ID
         self.kafka_topic = settings.KAFKA_SMS_TOPIC
-        
-        self.kafka_status_topic = getattr(settings, 'KAFKA_STATUS_SMS_TOPIC', 'notification.status.sms')
-        self._auto_offset_reset = 'earliest'
-        
-        self.consumer_conf = self.create_consumer_conf()
-        self.producer = Producer({'bootstrap.servers': self.kafka_broker})
-        
-        self.infobip_base_url = settings.INFOBIP_BASE_URL
-        self.infobip_api_key = settings.INFOBIP_API_KEY
-        self.infobip_sender = settings.INFOBIP_SENDER
-
-    def create_consumer_conf(self):
-        return {
-            'bootstrap.servers': self.kafka_broker,
-            'group.id': self.kafka_group_id,
-            'auto.offset.reset': self._auto_offset_reset
-        }
+        self.kafka_status_topic = settings.KAFKA_STATUS_SMS_TOPIC
+        self.consumer_conf = settings.get_consumer_conf()
+        self.producer = SerializingProducer(settings.get_producer_conf())
 
     def send_status(self, event_id, status, error_message=None):
-        if not event_id:
-            return
-        payload = {
-            "event_id": event_id,
-            "status": status,
-            "error_message": str(error_message) if error_message else None
-        }
+        if not event_id: return
+        payload = {"event_id": event_id, "status": status, "error_message": str(error_message) if error_message else None}
         try:
-            self.producer.produce(
-                topic=self.kafka_status_topic,
-                value=json.dumps(payload).encode('utf-8'),
-                key=event_id.encode('utf-8')
-            )
+            self.producer.produce(topic=self.kafka_status_topic, value=payload, key=event_id)
             self.producer.poll(0)
-        except Exception as e:
-            print(f"Gagal mengirim status SMS ke Kafka: {e}")
+        except Exception: pass
 
     def send_infobip_sms(self, receiver, text_content):
+        account_config = global_channel_manager.get_account("sms")
+        if not account_config: raise Exception("Kredensial SMS tidak ditemukan atau nonaktif di DB.")
+            
+        infobip_base_url = account_config.get("infobip_base_url")
+        infobip_api_key = account_config.get("infobip_api_key")
+        infobip_sender = account_config.get("infobip_sender")
+
         clean_receiver = receiver.replace('+', '')
-        
-        conn = http.client.HTTPSConnection(self.infobip_base_url)
-        payload = json.dumps({
-            "messages": [
-                {
-                    "destinations": [{"to": clean_receiver}],
-                    "sender": self.infobip_sender,
-                    "content": {"text": text_content}
-                }
-            ]
-        })
-        
-        headers = {
-            'Authorization': f'App {self.infobip_api_key}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }
+        conn = http.client.HTTPSConnection(infobip_base_url)
+        payload = json.dumps({"messages": [{"destinations": [{"to": clean_receiver}], "sender": infobip_sender, "content": {"text": text_content}}]})
+        headers = {'Authorization': f'App {infobip_api_key}', 'Content-Type': 'application/json'}
         
         conn.request("POST", "/sms/3/messages", payload, headers)
         res = conn.getresponse()
-        data = res.read()
-        response_str = data.decode("utf-8")
+        response_str = res.read().decode("utf-8")
         
-        if res.status not in (200, 201, 202):
-            raise Exception(f"Infobip API Error {res.status}: {response_str}")
-            
+        if res.status not in (200, 201, 202): raise Exception(f"Infobip API Error {res.status}: {response_str}")
         return response_str
 
     def consume(self):
-        consumer = Consumer(self.consumer_conf)
+        consumer = DeserializingConsumer(self.consumer_conf)
         consumer.subscribe([self.kafka_topic])
-        print(f"Broadcaster SMS (Infobip) Listening on topic: {self.kafka_topic}...")
+        print(f"[*] Broadcaster SMS Listening on topic: {self.kafka_topic}...", flush=True)
         
         try:
             while True:
                 msg = consumer.poll(1.0)
-                if msg is None:
-                    continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
-                        print(f"  Error: {msg.error()}")
-                        continue
+                if msg is None or msg.error(): continue
                 
-                event_id = None 
                 try:
-                    value = msg.value()
-                    data = json.loads(value.decode("utf-8"))
-                    event_id = data.get('event_id')
+                    data = msg.value()
+                    event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    receiver = data.get('receiver')
-                    if isinstance(receiver, list):
-                        receiver = receiver[0]
-                        
-                    body_text = data.get('body')
-                    print(f"Menerima SMS untuk: {receiver}")
+                    if not global_rate_limiter.acquire("sms"):
+                        self.send_status(event_id, "DROPPED", "Rate limit tercapai")
+                        continue
+
+                    receiver = data.get('receiver')[0] if isinstance(data.get('receiver'), list) else data.get('receiver')
                     
-                    response = self.send_infobip_sms(receiver, body_text)
-                    print(f"SMS berhasil dikirim ke {receiver} via Infobip.")
+                    print(f"\n=======================================================", flush=True)
+                    print(f"[{event_id}] Mencoba mengirim via Infobip dinamis...", flush=True)
+                    self.send_infobip_sms(receiver, data.get('body'))
+                    print(f"[INFOBIP] SMS sukses terkirim ke {receiver}", flush=True)
+                    
                     self.send_status(event_id, "SUCCESS")
-                    
                 except Exception as e:
-                    print(f"  Gagal memproses/mengirim SMS: {e}")
-                    if event_id:
-                        self.send_status(event_id, "FAILED", str(e))
-                        
+                    print(f"[{event_id}] [GAGAL] Pengiriman SMS: {e}", flush=True)
+                    if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))
         except KeyboardInterrupt:
-            print("\n  Stopped by user.")
+            pass
         finally:
             consumer.close()
-            self.producer.flush() 
-            print("  Consumer closed.")
+            self.producer.flush()

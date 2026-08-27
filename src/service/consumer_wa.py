@@ -1,147 +1,75 @@
-import json
-import http.client
-from confluent_kafka import Consumer, Producer, KafkaError
+from confluent_kafka import DeserializingConsumer, SerializingProducer
 from src.core.config import settings
+from src.core.rate_limiter import global_rate_limiter
+from src.core.channel_manager import global_channel_manager
+import http.client
+import json
 
 class ConsumerWA:
     def __init__(self):
-        self.kafka_broker = settings.KAFKA_BOOTSTRAP_SERVERS
-        self.kafka_group_id = settings.KAFKA_GROUP_ID
         self.kafka_topic = settings.KAFKA_WA_TOPIC
-        
-        # Topik khusus untuk mengirim laporan status WA
-        self.kafka_status_topic = getattr(settings, 'KAFKA_STATUS_WA_TOPIC', 'notification.status.wa')
-        
-        self._auto_offset_reset = 'earliest'
-        
-        self.consumer_conf = self.create_consumer_conf()
-        self.producer = Producer({'bootstrap.servers': self.kafka_broker})
-        
-        # Inisialisasi WHAPI Config
-        self.whapi_base_url = settings.WHAPI_BASE_URL
-        self.whapi_token = settings.WHAPI_TOKEN
-
-    def create_consumer_conf(self):
-        return {
-            'bootstrap.servers': self.kafka_broker,
-            'group.id': self.kafka_group_id,
-            'auto.offset.reset': self._auto_offset_reset
-        }
+        self.kafka_status_topic = settings.KAFKA_STATUS_WA_TOPIC
+        self.consumer_conf = settings.get_consumer_conf()
+        self.producer = SerializingProducer(settings.get_producer_conf())
 
     def send_status(self, event_id, status, error_message=None):
-        if not event_id:
-            return
-        payload = {
-            "event_id": event_id,
-            "status": status,
-            "error_message": str(error_message) if error_message else None
-        }
+        if not event_id: return
+        payload = {"event_id": event_id, "status": status, "error_message": str(error_message) if error_message else None}
         try:
-            self.producer.produce(
-                topic=self.kafka_status_topic,
-                value=json.dumps(payload).encode('utf-8'),
-                key=event_id.encode('utf-8')
-            )
+            self.producer.produce(topic=self.kafka_status_topic, value=payload, key=event_id)
             self.producer.poll(0)
-        except Exception as e:
-            print(f"Gagal mengirim status WA ke Kafka: {e}")
+        except Exception: pass
 
     def send_whapi_message(self, receiver, text_content):
-        """Fungsi khusus untuk menembak API WHAPI Cloud"""
-        # Bersihkan format nomor (hapus '+', WHAPI membutuhkan format E.164)
+        account_config = global_channel_manager.get_account("whatsapp")
+        if not account_config: raise Exception("Kredensial WhatsApp tidak ditemukan atau nonaktif di DB.")
+        
+        whapi_base_url = account_config.get("whapi_base_url")
+        whapi_token = account_config.get("whapi_token")
+
         clean_receiver = receiver.replace('+', '').replace(' ', '')
+        conn = http.client.HTTPSConnection(whapi_base_url)
+        payload = json.dumps({"typing_time": 0, "to": clean_receiver, "body": text_content.replace('\\n', '\n')})
+        headers = {'Authorization': f'Bearer {whapi_token}', 'Content-Type': 'application/json'}
         
-        conn = http.client.HTTPSConnection(self.whapi_base_url)
-        payload = json.dumps({
-            "typing_time": 0,
-            "to": clean_receiver,
-            # Hapus literal "\n" agar enter berfungsi di WhatsApp
-            "body": text_content.replace('\\n', '\n')
-        })
-        
-        headers = {
-            'Authorization': f'Bearer {self.whapi_token}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }
-        
-        # Endpoint Whapi untuk mengirim pesan teks standar
         conn.request("POST", "/messages/text", payload, headers)
         res = conn.getresponse()
-        data = res.read()
-        response_str = data.decode("utf-8")
+        response_str = res.read().decode("utf-8")
         
-        # 1. Cek Status HTTP Dasar
-        if res.status not in (200, 201):
-            raise Exception(f"WHAPI HTTP Error {res.status}: {response_str}")
-            
-        # 2. FITUR BARU: Deteksi Positif Palsu dari isi JSON Whapi
-        try:
-            response_json = json.loads(response_str)
-            
-            # Whapi kadang mengembalikan objek "message", kadang array "messages"
-            status = None
-            if "message" in response_json:
-                status = response_json["message"].get("status")
-            elif "messages" in response_json and len(response_json["messages"]) > 0:
-                status = response_json["messages"][0].get("status")
-                
-            # Jika Whapi menyatakan failed, batalkan status SUCCESS kita!
-            if status == "failed":
-                raise Exception("Whapi Delivery Failed: HP Pengirim Offline atau Nomor Tujuan tidak memiliki WhatsApp.")
-                
-        except json.JSONDecodeError:
-            pass # Abaikan jika kebetulan respons bukan format JSON
-            
+        if res.status not in (200, 201): raise Exception(f"WHAPI HTTP Error {res.status}: {response_str}")
         return response_str
 
     def consume(self):
-        consumer = Consumer(self.consumer_conf)
+        consumer = DeserializingConsumer(self.consumer_conf)
         consumer.subscribe([self.kafka_topic])
-        print(f"Broadcaster WhatsApp (WHAPI) Listening on topic: {self.kafka_topic}...")
+        print(f"[*] Broadcaster WA Listening on topic: {self.kafka_topic}...", flush=True)
         
         try:
             while True:
                 msg = consumer.poll(1.0)
-                if msg is None:
-                    continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
-                        print(f"  Error: {msg.error()}")
-                        continue
+                if msg is None or msg.error(): continue
                 
-                event_id = None 
                 try:
-                    value = msg.value()
-                    data = json.loads(value.decode("utf-8"))
-                    event_id = data.get('event_id')
+                    data = msg.value()
+                    event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    receiver = data.get('receiver')
-                    if isinstance(receiver, list):
-                        receiver = receiver[0]
-                        
-                    body_text = data.get('body')
+                    if not global_rate_limiter.acquire("whatsapp"):
+                        self.send_status(event_id, "DROPPED", "Rate limit tercapai")
+                        continue
+
+                    receiver = data.get('receiver')[0] if isinstance(data.get('receiver'), list) else data.get('receiver')
                     
-                    print(f"Menerima WA untuk: {receiver}")
+                    print(f"\n=======================================================", flush=True)
+                    print(f"[{event_id}] Mencoba mengirim via WHAPI dinamis...", flush=True)
+                    self.send_whapi_message(receiver, data.get('body'))
+                    print(f"[WHAPI] WhatsApp sukses terkirim ke {receiver}", flush=True)
                     
-                    # 1. Eksekusi pengiriman WA
-                    response = self.send_whapi_message(receiver, body_text)
-                    print(f"WhatsApp berhasil dikirim ke {receiver} via WHAPI.")
-                    
-                    # 2. Kirim laporan SUCCESS ke ETL Engine
                     self.send_status(event_id, "SUCCESS")
-                    
                 except Exception as e:
-                    print(f"  Gagal memproses/mengirim WA: {e}")
-                    # 3. Kirim laporan FAILED jika gagal
-                    if event_id:
-                        self.send_status(event_id, "FAILED", str(e))
-                        
+                    print(f"[{event_id}] [GAGAL] Pengiriman WA: {e}", flush=True)
+                    if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))
         except KeyboardInterrupt:
-            print("\n  Stopped by user.")
+            pass
         finally:
             consumer.close()
-            self.producer.flush() 
-            print("  Consumer closed.")
+            self.producer.flush()

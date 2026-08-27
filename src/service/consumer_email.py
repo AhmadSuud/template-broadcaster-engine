@@ -1,116 +1,79 @@
-import json
+from confluent_kafka import DeserializingConsumer, SerializingProducer
+from src.core.config import settings
+from src.core.rate_limiter import global_rate_limiter
+from src.core.channel_manager import global_channel_manager
 import smtplib
 from email.message import EmailMessage
-from confluent_kafka import Consumer, Producer, KafkaError
-from src.core.config import settings
 
 class ConsumerEmail:
     def __init__(self):
-        self.kafka_broker = settings.KAFKA_BOOTSTRAP_SERVERS
-        self.kafka_group_id = settings.KAFKA_GROUP_ID
         self.kafka_topic = settings.KAFKA_EMAIL_TOPIC
-        
-        # Topik khusus untuk mengirim laporan status
-        self.kafka_status_topic = getattr(settings, 'KAFKA_STATUS_EMAIL_TOPIC', 'notification.status.email')
-        
-        self._auto_offset_reset = 'earliest'
-        self.consumer_conf = self.create_consumer_conf()
-        
-        # TAMBAHAN: Inisialisasi Producer
-        self.producer = Producer({'bootstrap.servers': self.kafka_broker})
-        
-        self.smtp_host = settings.SMTP_HOST
-        self.smtp_port = settings.SMTP_PORT
-        self.smtp_user = settings.SMTP_USER
-        self.smtp_pass = settings.SMTP_PASS
+        self.kafka_status_topic = settings.KAFKA_STATUS_EMAIL_TOPIC
+        self.consumer_conf = settings.get_consumer_conf()
+        self.producer = SerializingProducer(settings.get_producer_conf())
 
-    def create_consumer_conf(self):
-        conf = {
-            'bootstrap.servers': self.kafka_broker,
-            'group.id': self.kafka_group_id,
-            'auto.offset.reset': self._auto_offset_reset
-        }
-        return conf
-
-    # TAMBAHAN: Fungsi untuk menembak status kembali ke Kafka
     def send_status(self, event_id, status, error_message=None):
-        if not event_id:
-            return
-        payload = {
-            "event_id": event_id,
-            "status": status,
-            "error_message": str(error_message) if error_message else None
-        }
+        if not event_id: return
+        payload = {"event_id": event_id, "status": status, "error_message": str(error_message) if error_message else None}
         try:
-            self.producer.produce(
-                topic=self.kafka_status_topic,
-                value=json.dumps(payload).encode('utf-8'),
-                key=event_id.encode('utf-8')
-            )
+            self.producer.produce(topic=self.kafka_status_topic, value=payload, key=event_id)
             self.producer.poll(0)
-        except Exception as e:
-            print(f"Gagal mengirim status ke Kafka: {e}")
+        except Exception: pass
 
-    def send_email(self, sender, receiver, subject, body):
+    def send_email(self, receiver, subject, body):
+        account_config = global_channel_manager.get_account("email")
+        if not account_config: raise Exception("Kredensial SMTP tidak ditemukan atau nonaktif di DB.")
+            
+        smtp_host = account_config.get("host")
+        smtp_port = int(account_config.get("port", 587))
+        smtp_user = account_config.get("username")
+        smtp_pass = account_config.get("password")
+        from_name = account_config.get("fromName", "BNI Notif")
+        from_addr = account_config.get("fromAddress", smtp_user)
+        
         msg = EmailMessage()
-        msg["From"] = sender
+        msg["From"] = f"{from_name} <{from_addr}>"
         msg["To"] = ", ".join(receiver) if isinstance(receiver, (list, tuple)) else receiver
         msg["Subject"] = subject
-        
         msg.set_content(body, subtype='html') 
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.ehlo()
-            server.starttls()  
-            server.ehlo()
-            server.login(self.smtp_user, self.smtp_pass)
+            if account_config.get("encryption", "").lower() in ["tls", "starttls"]:
+                server.starttls()  
+                server.ehlo()
+            server.login(smtp_user, smtp_pass)
             server.send_message(msg)
-            print("Email sent to", msg["To"])
 
     def consume(self):
-        consumer = Consumer(self.consumer_conf)
+        consumer = DeserializingConsumer(self.consumer_conf)
         consumer.subscribe([self.kafka_topic])
-        print(f"Broadcaster Email Listening on topic: {self.kafka_topic}...")
+        print(f"[*] Broadcaster Email Listening on topic: {self.kafka_topic}...", flush=True)
         
         try:
             while True:
                 msg = consumer.poll(1.0)
-                if msg is None:
-                    continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    else:
-                        print(f"  Error: {msg.error()}")
-                        continue
+                if msg is None or msg.error(): continue
                 
-                # Inisialisasi event_id agar aman jika terjadi error saat parsing JSON
-                event_id = None 
                 try:
-                    # Ambil data dari Kafka yang sudah di-render oleh ETL Engine
-                    value = msg.value()
-                    data = json.loads(value.decode("utf-8"))
-                    event_id = data.get('event_id')
+                    data = msg.value() 
+                    event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    print(f"Menerima email untuk: {data.get('receiver')} dengan subjek '{data.get('subject')}'")
+                    if not global_rate_limiter.acquire("email"):
+                        self.send_status(event_id, "DROPPED", "Rate limit tercapai")
+                        continue
+
+                    print(f"\n=======================================================", flush=True)
+                    print(f"[{event_id}] Mencoba mengirim via SMTP dinamis...", flush=True)
+                    self.send_email(data.get('receiver'), data.get('subject'), data.get('body'))
+                    print(f"[SMTP] Email sukses terkirim ke: {data.get('receiver')}", flush=True)
                     
-                    # 1. Eksekusi pengiriman email
-                    self.send_email(data['sender'], data['receiver'], data['subject'], data['body'])
-                    
-                    # 2. Jika sukses, kirim laporan SUCCESS ke ETL Engine
                     self.send_status(event_id, "SUCCESS")
-                    print(f"Status SUCCESS terkirim untuk event: {event_id}")
-                    
                 except Exception as e:
-                    print(f"  Failed to process message/send email: {e}")
-                    # 3. Jika gagal (misal email salah/SMTP putus), kirim laporan FAILED
-                    if event_id:
-                        self.send_status(event_id, "FAILED", str(e))
-                        
+                    print(f"[{event_id}] [GAGAL] Pengiriman Email: {e}", flush=True)
+                    if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))
         except KeyboardInterrupt:
-            print("\n  Stopped by user.")
+            pass
         finally:
             consumer.close()
-            # Pastikan semua antrean pesan status terkirim sebelum aplikasi mati
-            self.producer.flush() 
-            print("  Consumer closed.")
+            self.producer.flush()

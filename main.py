@@ -1,28 +1,37 @@
-import argparse
+import threading
+import sys
+import time
 
 from src.service.consumer_email import ConsumerEmail
 from src.service.consumer_sms import ConsumerSMS
 from src.service.consumer_wa import ConsumerWA
 
-parser = argparse.ArgumentParser()
+def run_email():
+    ConsumerEmail().consume()
 
-# TAMBAHAN: Update help text agar mencakup sms
-parser.add_argument("--mode", required=True, help="mode email / wa / sms", default='email')
+def run_wa():
+    ConsumerWA().consume()
 
-args = parser.parse_args()
+def run_sms():
+    ConsumerSMS().consume()
 
-if args.mode == 'email':
-    consumer_email = ConsumerEmail()
-    consumer_email.consume()
-    
-elif args.mode == 'wa':
-    consumer_wa = ConsumerWA()
-    consumer_wa.consume()
+if __name__ == '__main__':
+    print("=" * 70, flush=True)
+    print("Memulai All-in-One Broadcaster Engine (Avro, DB Config, Zero-Latency)...", flush=True)
+    print("=" * 70, flush=True)
 
-# TAMBAHAN: Blok eksekusi untuk mode sms
-elif args.mode == 'sms':
-    consumer_sms = ConsumerSMS()
-    consumer_sms.consume()
-    
-else:
-    print("Mode tidak dikenali! Silakan gunakan --mode email, --mode wa, atau --mode sms")
+    try:
+        t_email = threading.Thread(target=run_email, daemon=True)
+        t_wa = threading.Thread(target=run_wa, daemon=True)
+        t_sms = threading.Thread(target=run_sms, daemon=True)
+
+        t_email.start()
+        t_wa.start()
+        t_sms.start()
+
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n[INFO] Mematikan semua Broadcaster. Harap tunggu...", flush=True)
+        sys.exit(0)
