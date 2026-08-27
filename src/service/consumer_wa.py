@@ -4,6 +4,7 @@ from src.core.rate_limiter import global_rate_limiter
 from src.core.channel_manager import global_channel_manager
 import http.client
 import json
+import time
 
 class ConsumerWA:
     def __init__(self):
@@ -53,18 +54,19 @@ class ConsumerWA:
                     data = msg.value()
                     event_id = data.get('event_id', 'UNKNOWN_EVENT')
                     
-                    if not global_rate_limiter.acquire("whatsapp"):
-                        self.send_status(event_id, "DROPPED", "Rate limit tercapai")
-                        continue
+                    # if not global_rate_limiter.acquire("whatsapp"):
+                    #     self.send_status(event_id, "DROPPED", "Rate limit tercapai")
+                    #     continue
 
                     receiver = data.get('receiver')[0] if isinstance(data.get('receiver'), list) else data.get('receiver')
                     
                     print(f"\n=======================================================", flush=True)
                     print(f"[{event_id}] Mencoba mengirim via WHAPI dinamis...", flush=True)
-                    self.send_whapi_message(receiver, data.get('body'))
+                    # self.send_whapi_message(receiver, data.get('body'))
                     print(f"[WHAPI] WhatsApp sukses terkirim ke {receiver}", flush=True)
                     
                     self.send_status(event_id, "SUCCESS")
+                    time.sleep(0.52)
                 except Exception as e:
                     print(f"[{event_id}] [GAGAL] Pengiriman WA: {e}", flush=True)
                     if event_id != 'UNKNOWN_EVENT': self.send_status(event_id, "FAILED", str(e))

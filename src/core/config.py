@@ -54,6 +54,7 @@ class Settings(BaseSettings):
             'group.id': self.KAFKA_GROUP_ID,
             'auto.offset.reset': 'earliest',
             'key.deserializer': StringDeserializer('utf_8'),
+            'max.poll.interval.ms': 500000,
             'value.deserializer': AvroDeserializer(self.get_sr_client(), BROADCAST_SCHEMA_STR, lambda obj, ctx: obj)
         }
         if self.KAFKA_SECURITY_PROTOCOL:
